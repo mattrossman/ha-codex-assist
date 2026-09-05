@@ -8,11 +8,13 @@ calls are stubbed.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
 import voluptuous as vol
 from homeassistant.components import conversation
+from homeassistant.components.conversation import trace as conversation_trace
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
@@ -22,16 +24,21 @@ from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.codex_assist import DOMAIN
-from custom_components.codex_assist.ai_task import _structured_output_format
+from custom_components.codex_assist.ai_task import (
+    _structured_data_from_text,
+    _structured_output_format,
+)
 from custom_components.codex_assist.codex_client import (
     CodexCitation,
     CodexCitationDelta,
     CodexClient,
+    CodexResponseItemDelta,
     CodexTextDelta,
     CodexToolCall,
     CodexToolCallDelta,
 )
 from custom_components.codex_assist.config_flow import (
+    CONF_PROMPT,
     SECTION_ADVANCED_SETTINGS,
     SECTION_CHAT_SETTINGS,
     SECTION_IMAGE_SETTINGS,
@@ -110,6 +117,75 @@ async def test_conversation_turn_streams_codex_reply(
 
     speech = result.response.speech["plain"]["speech"]
     assert speech == "The porch light is on."
+
+
+async def test_conversation_replays_native_codex_output_on_next_turn(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation_trace.async_clear_traces()
+    await _setup_entry(hass)
+    caplog.set_level(logging.DEBUG, logger=conversation.ChatLog.__module__)
+    reasoning = {
+        "id": "rs_1",
+        "type": "reasoning",
+        "encrypted_content": "encrypted-state",
+        "summary": [],
+    }
+    message = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [
+            {"type": "output_text", "text": "First reply.", "annotations": []}
+        ],
+    }
+    calls: list[list[dict[str, object]]] = []
+
+    async def fake_stream_turn(self: CodexClient, **kwargs: object):
+        input_items = kwargs["input_items"]
+        assert isinstance(input_items, list)
+        calls.append(input_items)
+        if len(calls) == 1:
+            yield CodexTextDelta("First reply.")
+            yield CodexResponseItemDelta(reasoning)
+            yield CodexResponseItemDelta(message)
+            return
+        yield CodexTextDelta("Second reply.")
+
+    monkeypatch.setattr(CodexClient, "stream_turn", fake_stream_turn)
+
+    first = await conversation.async_converse(
+        hass,
+        "First question",
+        None,
+        Context(),
+        agent_id="conversation.codex_assist",
+    )
+    second = await conversation.async_converse(
+        hass,
+        "Second question",
+        first.conversation_id,
+        Context(),
+        agent_id="conversation.codex_assist",
+    )
+
+    assert second.response.speech["plain"]["speech"] == "Second reply."
+    assert calls[1] == [
+        {"role": "user", "content": "First question"},
+        reasoning,
+        message,
+        {"role": "user", "content": "Second question"},
+    ]
+    assert "encrypted-state" not in caplog.text
+    assert "CodexNativeState(item_count=2)" in caplog.text
+    serialized_traces = [trace.as_dict() for trace in conversation_trace.async_get_traces()]
+    serialized_trace_text = str(serialized_traces)
+    assert "encrypted-state" not in serialized_trace_text
+    assert "'redacted': True" in serialized_trace_text
+    assert "'item_count': 2" in serialized_trace_text
 
 
 async def test_web_search_citations_are_displayable_but_not_spoken(
@@ -267,6 +343,19 @@ async def test_options_flow_uses_real_home_assistant_contract(
         SECTION_ADVANCED_SETTINGS,
         SECTION_IMAGE_SETTINGS,
     ]
+    advanced_section = next(
+        value
+        for key, value in result["data_schema"].schema.items()
+        if key.schema == SECTION_ADVANCED_SETTINGS
+    )
+    prompt_selector = next(
+        value
+        for key, value in advanced_section.schema.schema.items()
+        if key.schema == CONF_PROMPT
+    )
+    assert isinstance(prompt_selector, selector.TextSelector)
+    assert prompt_selector.config["multiline"] is True
+    prompt = "# House rules\n\n- **Never** unlock doors.\n- Reply concisely."
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
@@ -277,7 +366,7 @@ async def test_options_flow_uses_real_home_assistant_contract(
                 "web_search": True,
             },
             SECTION_ADVANCED_SETTINGS: {
-                "prompt": "Keep it short.",
+                "prompt": prompt,
                 "reasoning_effort": "low",
             },
             SECTION_IMAGE_SETTINGS: {
@@ -290,7 +379,7 @@ async def test_options_flow_uses_real_home_assistant_contract(
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["data"]["text_verbosity"] == "low"
     assert result["data"]["web_search"] is True
-    assert entry.options["prompt"] == "Keep it short."
+    assert entry.options["prompt"] == prompt
 
 
 def test_structured_output_uses_real_home_assistant_schema_converter() -> None:

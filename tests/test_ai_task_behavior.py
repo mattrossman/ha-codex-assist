@@ -60,6 +60,85 @@ def test_structured_data_from_text_validates_requested_structure(ai_task_module)
         ai_task_module._structured_data_from_text('{"wrong":"shape"}', RejectingStructure())
 
 
+def test_structured_data_from_text_restores_nested_optional_omission(ai_task_module):
+    structure = ai_task_module.vol.Schema(
+        {
+            ai_task_module.vol.Required("rooms"): [
+                {
+                    ai_task_module.vol.Required("name"): str,
+                    ai_task_module.vol.Optional("note"): str,
+                }
+            ]
+        }
+    )
+
+    assert ai_task_module._structured_data_from_text(
+        '{"rooms":[{"name":"Kitchen","note":null}]}', structure
+    ) == {"rooms": [{"name": "Kitchen"}]}
+
+
+def test_structured_data_from_text_restores_optional_omission_inside_any(ai_task_module):
+    structure = ai_task_module.vol.Schema(
+        {
+            ai_task_module.vol.Required("choice"): ai_task_module.vol.Any(
+                {
+                    ai_task_module.vol.Required("kind"): "a",
+                    ai_task_module.vol.Optional("note"): str,
+                },
+                {
+                    ai_task_module.vol.Required("kind"): "b",
+                    ai_task_module.vol.Optional("count"): int,
+                },
+            )
+        }
+    )
+
+    assert ai_task_module._structured_data_from_text(
+        '{"choice":{"kind":"a","note":null}}', structure
+    ) == {"choice": {"kind": "a"}}
+
+
+def test_structured_data_from_text_preserves_required_nullable_value(ai_task_module):
+    structure = ai_task_module.vol.Schema(
+        {ai_task_module.vol.Required("value"): ai_task_module.vol.Any(str, None)}
+    )
+
+    assert ai_task_module._structured_data_from_text('{"value":null}', structure) == {
+        "value": None
+    }
+
+
+def test_structured_data_from_text_removes_null_composed_key_placeholder(ai_task_module):
+    structure = ai_task_module.vol.Schema(
+        {
+            ai_task_module.vol.Required(
+                ai_task_module.vol.Any("email", "phone")
+            ): str
+        }
+    )
+
+    assert ai_task_module._structured_data_from_text(
+        '{"email":"person@example.com","phone":null}', structure
+    ) == {"email": "person@example.com"}
+
+
+def test_structured_data_from_text_restores_optional_omission_inside_all(ai_task_module):
+    structure = ai_task_module.vol.Schema(
+        {
+            ai_task_module.vol.Required("payload"): ai_task_module.vol.All(
+                {
+                    ai_task_module.vol.Required("name"): str,
+                    ai_task_module.vol.Optional("note", default="fallback"): str,
+                }
+            )
+        }
+    )
+
+    assert ai_task_module._structured_data_from_text(
+        '{"payload":{"name":"x","note":null}}', structure
+    ) == {"payload": {"name": "x"}}
+
+
 def test_structured_output_format_converts_ai_task_schema(ai_task_module):
     task = type(
         "Task",
@@ -78,7 +157,72 @@ def test_structured_output_format_converts_ai_task_schema(ai_task_module):
     assert ai_task_module._structured_output_format(task, chat_log) == {
         "type": "json_schema",
         "name": "porch_state",
+        "strict": True,
         "schema": {"state": str},
+    }
+
+
+def test_structured_output_format_preserves_optional_semantics_in_nested_schema(
+    ai_task_module,
+    monkeypatch,
+):
+    converted_schema = {
+        "type": "object",
+        "properties": {
+            "state": {"type": "string", "enum": ["on", "off"]},
+            "note": {"type": "string"},
+            "required_nullable": {"type": "string", "nullable": True},
+            "rooms": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["auto", "manual"]},
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+        "required": ["state", "required_nullable", "rooms"],
+    }
+    monkeypatch.setattr(
+        ai_task_module,
+        "convert",
+        lambda structure, custom_serializer: converted_schema,
+    )
+    task = type("Task", (), {"name": "Home State", "structure": object()})()
+    chat_log = type("ChatLog", (), {"llm_api": None})()
+
+    assert ai_task_module._structured_output_format(task, chat_log) == {
+        "type": "json_schema",
+        "name": "home_state",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "state": {"type": "string", "enum": ["on", "off"]},
+                "note": {"type": ["string", "null"]},
+                "required_nullable": {"type": ["string", "null"]},
+                "rooms": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "mode": {
+                                "type": ["string", "null"],
+                                "enum": ["auto", "manual", None],
+                            },
+                        },
+                        "required": ["name", "mode"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["state", "note", "required_nullable", "rooms"],
+            "additionalProperties": False,
+        },
     }
 
 
@@ -314,3 +458,56 @@ async def test_ai_task_image_retry_reauths_when_refreshed_token_is_rejected(
             image_model="gpt-image-2-medium",
             image_size="1024x1024",
         )
+
+
+@pytest.mark.asyncio
+async def test_ai_task_uses_one_tools_disabled_turn_after_five_tool_rounds(
+    ai_task_module,
+    monkeypatch,
+):
+    calls = []
+
+    async def stream_turn(**kwargs):
+        calls.append(kwargs)
+        chat_log.unresponded_tool_results = kwargs["allow_tools"]
+        return kwargs["allow_tools"]
+
+    monkeypatch.setattr(ai_task_module, "_stream_codex_turn_into_chat_log", stream_turn)
+
+    tool = type(
+        "Tool",
+        (),
+        {
+            "name": "HassTurnOn",
+            "description": "Turn on an exposed Home Assistant entity.",
+            "parameters": ai_task_module.vol.Schema({}),
+        },
+    )()
+    llm_api = type(
+        "LLMApi",
+        (),
+        {"tools": [tool], "custom_serializer": None},
+    )()
+    chat_log = type(
+        "ChatLog",
+        (),
+        {"unresponded_tool_results": True, "content": [], "llm_api": llm_api},
+    )()
+    await ai_task_module._run_codex_ai_task_chat_log(
+        hass=object(),
+        entry=object(),
+        auth_client=object(),
+        tokens=CodexTokenSet("access-1", "refresh-1"),
+        codex=object(),
+        chat_log=chat_log,
+        entity_id="ai_task.codex_assist",
+        model="gpt-5.4",
+        prompt="Be concise.",
+        reasoning_effort="low",
+        reasoning_summary="auto",
+        text_verbosity="medium",
+    )
+
+    assert [call["allow_tools"] for call in calls] == [True, True, True, True, True, False]
+    assert [bool(call["tools"]) for call in calls] == [True, True, True, True, True, False]
+    assert all(call["tools"][0]["name"] == "HassTurnOn" for call in calls[:5])

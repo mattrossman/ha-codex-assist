@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import re
 from typing import TYPE_CHECKING, Any
@@ -42,6 +43,7 @@ from .conversation import (
     _codex_tools_from_chat_log,
     _instructions_from_chat_log,
     _refresh_runtime_tokens,
+    _run_tool_rounds,
     _stream_codex_turn_into_chat_log,
 )
 from .error_formatting import request_failure_text
@@ -288,7 +290,8 @@ async def _run_codex_ai_task_chat_log(
     web_search: bool = False,
 ) -> None:
     """Run Codex over an AI Task chat log with one auth refresh retry."""
-    for _iteration in range(MAX_TOOL_ITERATIONS):
+    async def run_tool_round(_round_number: int, allow_tools: bool) -> bool:
+        nonlocal codex, tokens
         try:
             await _stream_codex_turn_into_chat_log(
                 chat_log=chat_log,
@@ -297,14 +300,19 @@ async def _run_codex_ai_task_chat_log(
                 model=model,
                 instructions=_instructions_from_chat_log(chat_log, prompt),
                 input_items=await _codex_input_from_chat_log(hass, chat_log),
-                tools=_codex_tools_from_chat_log(
-                    chat_log,
-                    enable_web_search=_web_search_enabled(web_search, text_format=text_format),
+                tools=(
+                    _codex_tools_from_chat_log(
+                        chat_log,
+                        enable_web_search=_web_search_enabled(web_search, text_format=text_format),
+                    )
+                    if allow_tools
+                    else []
                 ),
                 reasoning_effort=reasoning_effort,
                 reasoning_summary=reasoning_summary,
                 text_verbosity=text_verbosity,
                 text_format=text_format,
+                allow_tools=allow_tools,
             )
         except CodexAuthenticationError as err:
             LOGGER.warning(
@@ -327,21 +335,32 @@ async def _run_codex_ai_task_chat_log(
                     model=model,
                     instructions=_instructions_from_chat_log(chat_log, prompt),
                     input_items=await _codex_input_from_chat_log(hass, chat_log),
-                    tools=_codex_tools_from_chat_log(
-                        chat_log,
-                        enable_web_search=_web_search_enabled(web_search, text_format=text_format),
+                    tools=(
+                        _codex_tools_from_chat_log(
+                            chat_log,
+                            enable_web_search=_web_search_enabled(
+                                web_search, text_format=text_format
+                            ),
+                        )
+                        if allow_tools
+                        else []
                     ),
                     reasoning_effort=reasoning_effort,
                     reasoning_summary=reasoning_summary,
                     text_verbosity=text_verbosity,
                     text_format=text_format,
+                    allow_tools=allow_tools,
                 )
             except CodexAuthenticationError as retry_err:
                 raise CodexReauthRequiredError(
                     "Codex access token was rejected after refresh"
                 ) from retry_err
-        if not chat_log.unresponded_tool_results:
-            break
+        return bool(chat_log.unresponded_tool_results)
+
+    await _run_tool_rounds(
+        max_tool_rounds=MAX_TOOL_ITERATIONS,
+        run_iteration=run_tool_round,
+    )
 
 
 async def _generate_codex_ai_task_image(
@@ -456,8 +475,65 @@ def _structured_data_from_text(text: str, structure: Any | None) -> Any:
         )
         raise HomeAssistantError("Codex Assist AI Task returned invalid JSON") from err
     try:
-        return structure(data)
+        return structure(_remove_optional_null_values(data, structure))
     except vol.Invalid as err:
         raise HomeAssistantError(
             "Codex Assist AI Task response did not match the requested structure"
         ) from err
+
+
+def _remove_optional_null_values(data: Any, structure: Any) -> Any:
+    """Restore omitted optional fields after strict mode represents them as null."""
+    schema = structure.schema if isinstance(structure, vol.Schema) else structure
+    if isinstance(schema, vol.Any):
+        for validator in schema.validators:
+            normalized = _remove_optional_null_values(data, validator)
+            try:
+                vol.Schema(validator)(normalized)
+            except vol.Invalid:
+                continue
+            return normalized
+        return data
+    if isinstance(schema, vol.All):
+        normalized = data
+        for validator in schema.validators:
+            normalized = _remove_optional_null_values(normalized, validator)
+        return normalized
+    if isinstance(data, list):
+        if isinstance(schema, list) and len(schema) == 1:
+            return [_remove_optional_null_values(item, schema[0]) for item in data]
+        return data
+    if not isinstance(data, dict) or not isinstance(schema, dict):
+        return data
+
+    normalized = dict(data)
+    for key, value_schema in schema.items():
+        key_name = getattr(key, "schema", getattr(key, "key", key))
+        if isinstance(key_name, vol.Any):
+            for candidate_key in key_name.validators:
+                try:
+                    present = candidate_key in normalized
+                except TypeError:
+                    continue
+                if not present:
+                    continue
+                if normalized[candidate_key] is None:
+                    del normalized[candidate_key]
+                else:
+                    normalized[candidate_key] = _remove_optional_null_values(
+                        normalized[candidate_key], value_schema
+                    )
+            continue
+        if key_name not in normalized:
+            continue
+        if (
+            isinstance(key, vol.Optional)
+            and not isinstance(key, vol.Required)
+            and normalized[key_name] is None
+        ):
+            del normalized[key_name]
+        else:
+            normalized[key_name] = _remove_optional_null_values(
+                normalized[key_name], value_schema
+            )
+    return normalized

@@ -141,6 +141,14 @@ def install_homeassistant_fakes(monkeypatch):
     class SelectSelector:
         config: SelectSelectorConfig
 
+    @dataclass
+    class TextSelectorConfig:
+        multiline: bool = False
+
+    @dataclass
+    class TextSelector:
+        config: TextSelectorConfig
+
     class Section:
         def __init__(self, schema, options=None):
             self.schema = schema
@@ -175,6 +183,16 @@ def install_homeassistant_fakes(monkeypatch):
             )
 
     class Required(Optional):
+        pass
+
+    class Any:
+        def __init__(self, *validators):
+            self.validators = validators
+
+        def __call__(self, value):
+            return value
+
+    class All(Any):
         pass
 
     config_entries.ConfigFlow = ConfigFlow
@@ -219,12 +237,16 @@ def install_homeassistant_fakes(monkeypatch):
     selector.SelectSelector = SelectSelector
     selector.SelectSelectorConfig = SelectSelectorConfig
     selector.SelectSelectorMode = SelectSelectorMode
+    selector.TextSelector = TextSelector
+    selector.TextSelectorConfig = TextSelectorConfig
     util_json.json_loads = __import__("json").loads
     util.slugify = lambda value: value.lower().replace(" ", "_")
     voluptuous_openapi.convert = lambda schema, custom_serializer=None: getattr(
         schema, "schema", schema
     )
     vol.Invalid = Invalid
+    vol.Any = Any  # type: ignore[attr-defined]
+    vol.All = All  # type: ignore[attr-defined]
     vol.Schema = Schema
     vol.Optional = Optional
     vol.Required = Required  # type: ignore[attr-defined]
